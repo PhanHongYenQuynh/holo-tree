@@ -18,13 +18,63 @@ const FLICK_THRESHOLD = 0.08;
 const PINCH_THRESHOLD = 0.06; 
 const CENTER_VIEW_POS = new THREE.Vector3(0, 0, 8); // In front of tree, close to camera
 
+// --- IndexedDB Helper ---
+const DB_NAME = 'XmasTreeDB';
+const STORE_NAME = 'memories';
+const DB_VERSION = 1;
+
+const initDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (e) => {
+      const db = (e.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+    };
+  });
+};
+
+const savePhotoToDB = async (id: string, base64: string, width: number, height: number) => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    await tx.objectStore(STORE_NAME).put({ id, base64, width, height, date: Date.now() });
+    console.log("Image saved to IndexedDB:", id);
+  } catch (err) {
+    console.error('Failed to save photo', err);
+  }
+};
+
+const loadPhotosFromDB = async (): Promise<any[]> => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const photos = await new Promise<any[]>((resolve) => {
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.getAll();
+      req.onsuccess = () => resolve(req.result);
+    });
+    console.log("Loaded photos from IndexedDB:", photos.length);
+    return photos;
+  } catch (err) {
+    console.error('Failed to load photos', err);
+    return [];
+  }
+};
+
+// ... (Colors and Shaders remain unchanged) ...
+
+
+
 // LED Colors
 const SPARKLE_COLORS = [
   new THREE.Color('#FF0000'), // Red
   new THREE.Color('#FFD700'), // Gold
   new THREE.Color('#00FF00'), // Green
   new THREE.Color('#0000FF'), // Blue
-  new THREE.Color('#FFFFFF'), // White
 ];
 
 // --- Shaders ---
@@ -122,6 +172,7 @@ export const ChristmasTree: React.FC = () => {
     treeScale: 1.0,
     // INITIAL POS: Center of screen (Half height down)
     treePos: new THREE.Vector3(0, -6, 0),
+    photoGlobalIndex: 0
   });
 
   const sceneRefs = useRef({
@@ -137,25 +188,54 @@ export const ChristmasTree: React.FC = () => {
   const handsRef = useRef<any>(null);
   const cameraRef = useRef<any>(null);
 
-  // --- Photo Logic ---
-  const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && sceneRefs.current.treeGroup) {
-      Array.from(e.target.files).forEach((file) => {
-        const reader = new FileReader();
-        reader.onload = (event) => {
-          const img = new Image();
-          img.src = event.target?.result as string;
-          img.onload = () => {
+  // Load photos on start
+  useEffect(() => {
+    loadPhotosFromDB().then(savedPhotos => {
+      savedPhotos.sort((a,b) => a.date - b.date); // Load in order
+      savedPhotos.forEach(p => {
+        const img = new Image();
+        img.src = p.base64;
+        img.onload = () => {
             const tex = new THREE.Texture(img);
+            tex.colorSpace = THREE.SRGBColorSpace;
             tex.minFilter = THREE.LinearFilter;
             tex.magFilter = THREE.LinearFilter;
             tex.generateMipmaps = false;
             tex.needsUpdate = true;
-            createPhotoMesh(tex, img.width, img.height);
-          };
+            createPhotoMesh(tex, p.width, p.height);
         };
-        reader.readAsDataURL(file as Blob);
       });
+    });
+  }, []);
+
+  // --- Photo Logic ---
+  const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && sceneRefs.current.treeGroup) {
+      Array.from(e.target.files).forEach((file: File) => {
+        // 1. Create ObjectURL for immediate display
+        const url = URL.createObjectURL(file);
+        const loader = new THREE.TextureLoader();
+        loader.load(url, (tex) => {
+           tex.colorSpace = THREE.SRGBColorSpace;
+           tex.minFilter = THREE.LinearFilter;
+           tex.magFilter = THREE.LinearFilter;
+           tex.generateMipmaps = false;
+           
+           const w = tex.image.width;
+           const h = tex.image.height;
+           createPhotoMesh(tex, w, h);
+           
+           // 2. Convert to Base64 for Persistence
+           const reader = new FileReader();
+           reader.onload = (evt) => {
+               const base64 = evt.target?.result as string;
+               const id = `photo_${Date.now()}_${Math.random()}`;
+               savePhotoToDB(id, base64, w, h);
+           };
+           reader.readAsDataURL(file);
+        });
+      });
+      e.target.value = '';
     }
   };
 
@@ -174,7 +254,11 @@ export const ChristmasTree: React.FC = () => {
 
     // 1. Photo
     const geom = new THREE.PlaneGeometry(width, height);
-    const mat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
+    const mat = new THREE.MeshBasicMaterial({ 
+        map: texture, 
+        side: THREE.DoubleSide,
+        color: 0xffffff // Fallback color
+    });
     const photoMesh = new THREE.Mesh(geom, mat);
     photoMesh.name = "visual";
     photoGroup.add(photoMesh);
@@ -196,15 +280,25 @@ export const ChristmasTree: React.FC = () => {
     hitbox.name = "hitbox";
     photoGroup.add(hitbox);
 
-    // Position on Tree
-    const t = Math.random(); 
-    // Spiral distribution
-    const y = 1.0 + t * (TREE_HEIGHT - 3.0);
-    const r = (1 - y / TREE_HEIGHT) * BASE_RADIUS + 0.8; 
-    const theta = y * 1.5 + (Math.random() * Math.PI * 2);
+    // Position on Tree: Golden Spiral Distribution
+    const index = state.current.photoGlobalIndex;
+    state.current.photoGlobalIndex += 1;
+
+    // Golden Angle ~ 2.39996...
+    const goldenAngle = Math.PI * (3 - Math.sqrt(5)); 
+    
+    // Vertical position decreases with index (Top down filling)
+    const yStep = 1.0; 
+    let y = (TREE_HEIGHT - 2.0) - (index * 0.8); 
+    if (y < 2.0) y = Math.max(1.0, (TREE_HEIGHT - 2.0) - (Math.random() * (TREE_HEIGHT - 4.0))); 
+
+    // Increase offset to 0.8 to ensure it floats ABOVE particles and ornaments
+    const r = ((1 - y / TREE_HEIGHT) * BASE_RADIUS) + 0.8; 
+    const theta = index * goldenAngle;
 
     photoGroup.position.set(r * Math.cos(theta), y, r * Math.sin(theta));
     photoGroup.lookAt(0, y, 0);
+    photoGroup.rotateX(-0.1); 
 
     photoGroup.userData = {
       isPhoto: true,
@@ -213,6 +307,7 @@ export const ChristmasTree: React.FC = () => {
       isReturning: false,
     };
 
+    console.log("Created Photo Mesh at:", y, r); // Debug log
     sceneRefs.current.treeGroup.add(photoGroup);
     sceneRefs.current.photos.push(photoGroup);
     setPhotoCount(prev => prev + 1);
