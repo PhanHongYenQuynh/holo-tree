@@ -1,0 +1,7 @@
+{
+  "name": "Mars Particle AR",
+  "description": "Interactive WebAR particle system controlled by hand gestures using MediaPipe and Three.js.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
